@@ -26,11 +26,38 @@ export const useDarkPool = () => {
         return new Program(idl as Idl, provider);
     }, [provider]);
 
+    const getOrderPda = (owner: PublicKey, orderIdBn: BN) =>
+        PublicKey.findProgramAddressSync(
+            [Buffer.from("order"), owner.toBuffer(), orderIdBn.toArrayLike(Buffer, "le", 8)],
+            PROGRAM_ID
+        )[0];
+
+    const getOrderbookPda = (market: PublicKey) =>
+        PublicKey.findProgramAddressSync([Buffer.from("orderbook"), market.toBuffer()], PROGRAM_ID)[0];
+
+    const initializeOrderbook = async (market: PublicKey) => {
+        if (!program || !wallet) throw new Error("Wallet not connected");
+
+        const orderbookPda = getOrderbookPda(market);
+
+        const tx = await program.methods
+            .initializeOrderbook(market)
+            .accounts({
+                orderbook: orderbookPda,
+                authority: wallet.publicKey,
+                systemProgram: SystemProgram.programId,
+            })
+            .rpc();
+
+        return { tx, orderbookPda };
+    };
+
     const placeOrder = async (
         orderId: number,
         side: { buy: {} } | { sell: {} },
         amount: number,
-        price: number
+        price: number,
+        market: PublicKey
     ) => {
         if (!program || !wallet) throw new Error("Wallet not connected");
 
@@ -38,39 +65,32 @@ export const useDarkPool = () => {
         const amountBn = new BN(amount);
         const priceBn = new BN(price);
 
-        const [orderPda] = PublicKey.findProgramAddressSync(
-            [Buffer.from("order"), wallet.publicKey.toBuffer(), orderIdBn.toArrayLike(Buffer, "le", 8)],
-            PROGRAM_ID
-        );
+        const orderPda = getOrderPda(wallet.publicKey, orderIdBn);
+        const orderbookPda = getOrderbookPda(market);
 
-        const [orderbookPda] = PublicKey.findProgramAddressSync(
-            [Buffer.from("orderbook"), new PublicKey("11111111111111111111111111111111").toBuffer()],
-            PROGRAM_ID
-        );
+        const tx = await program.methods
+            .placeOrder(orderIdBn, side, amountBn, priceBn)
+            .accounts({
+                order: orderPda,
+                orderbook: orderbookPda,
+                owner: wallet.publicKey,
+                systemProgram: SystemProgram.programId,
+            })
+            .rpc();
 
-        try {
-            const tx = await program.methods
-                .placeOrder(orderIdBn, side, amountBn, priceBn)
-                .accounts({
-                    order: orderPda,
-                    orderbook: orderbookPda,
-                    owner: wallet.publicKey,
-                    systemProgram: SystemProgram.programId,
-                })
-                .rpc();
-
-            console.log("Order placed:", tx);
-            return { tx, orderPda };
-        } catch (error) {
-            console.error("Error placing order:", error);
-            throw error;
-        }
+        return { tx, orderPda };
     };
 
-    const delegateOrder = async (orderPda: PublicKey, orderId: number) => {
+    const delegateOrder = async (
+        orderPda: PublicKey,
+        orderId: number,
+        validUntil: number,
+        commitFreqMs: number
+    ) => {
         if (!program || !wallet) throw new Error("Wallet not connected");
 
         const orderIdBn = new BN(orderId);
+        const validUntilBn = new BN(validUntil);
 
         // PDAs for MagicBlock Delegation
         const [delegationBuffer] = PublicKey.findProgramAddressSync(
@@ -88,31 +108,109 @@ export const useDarkPool = () => {
             DELEGATION_PROGRAM
         );
 
-        try {
-            const tx = await program.methods
-                .delegateOrder(orderIdBn, new BN(1000000), 1000)
-                .accounts({
-                    order: orderPda,
-                    owner: wallet.publicKey,
-                    delegationBuffer,
-                    delegationRecord,
-                    delegationMetadata,
-                    delegationProgram: DELEGATION_PROGRAM,
-                    systemProgram: SystemProgram.programId,
-                })
-                .rpc();
+        const tx = await program.methods
+            .delegateOrder(orderIdBn, validUntilBn, commitFreqMs)
+            .accounts({
+                order: orderPda,
+                owner: wallet.publicKey,
+                delegationBuffer,
+                delegationRecord,
+                delegationMetadata,
+                delegationProgram: DELEGATION_PROGRAM,
+                systemProgram: SystemProgram.programId,
+            })
+            .rpc();
 
-            console.log("Order delegated:", tx);
-            return tx;
-        } catch (error) {
-            console.error("Error delegating order:", error);
-            throw error;
-        }
+        return tx;
+    };
+
+    const cancelOrder = async (orderId: number) => {
+        if (!program || !wallet) throw new Error("Wallet not connected");
+
+        const orderIdBn = new BN(orderId);
+        const orderPda = getOrderPda(wallet.publicKey, orderIdBn);
+
+        const tx = await program.methods
+            .cancelOrder(orderIdBn)
+            .accounts({
+                order: orderPda,
+                owner: wallet.publicKey,
+            })
+            .rpc();
+
+        return tx;
+    };
+
+    const pauseMarket = async (market: PublicKey) => {
+        if (!program || !wallet) throw new Error("Wallet not connected");
+
+        const orderbookPda = getOrderbookPda(market);
+
+        const tx = await program.methods
+            .pauseMarket()
+            .accounts({
+                orderbook: orderbookPda,
+                authority: wallet.publicKey,
+            })
+            .rpc();
+
+        return tx;
+    };
+
+    const resumeMarket = async (market: PublicKey) => {
+        if (!program || !wallet) throw new Error("Wallet not connected");
+
+        const orderbookPda = getOrderbookPda(market);
+
+        const tx = await program.methods
+            .resumeMarket()
+            .accounts({
+                orderbook: orderbookPda,
+                authority: wallet.publicKey,
+            })
+            .rpc();
+
+        return tx;
+    };
+
+    const matchOrders = async (
+        market: PublicKey,
+        tradeId: number,
+        buyOrder: PublicKey,
+        sellOrder: PublicKey
+    ) => {
+        if (!program || !wallet) throw new Error("Wallet not connected");
+
+        const tradeIdBn = new BN(tradeId);
+        const orderbookPda = getOrderbookPda(market);
+        const [tradeResultPda] = PublicKey.findProgramAddressSync(
+            [Buffer.from("trade"), tradeIdBn.toArrayLike(Buffer, "le", 8)],
+            PROGRAM_ID
+        );
+
+        const tx = await program.methods
+            .matchOrders(tradeIdBn)
+            .accounts({
+                tradeResult: tradeResultPda,
+                buyOrder,
+                sellOrder,
+                orderbook: orderbookPda,
+                matcher: wallet.publicKey,
+                systemProgram: SystemProgram.programId,
+            })
+            .rpc();
+
+        return tx;
     };
 
     return {
         program,
+        initializeOrderbook,
         placeOrder,
         delegateOrder,
+        cancelOrder,
+        pauseMarket,
+        resumeMarket,
+        matchOrders,
     };
 };
